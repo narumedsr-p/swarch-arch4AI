@@ -1,14 +1,14 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** นฤเมศร์ พิทยจำรัส
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6731328921
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** B. Canteen kiosk
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,9 +58,9 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Availability (offline tolerance) | The kiosk must accept and durably store every review even while Wi-Fi is down for minutes, several times a day, so nothing is lost either way. |
+| 2 | Latency (relaxed) | No real-time requirement: labels only need to exist by the end of the day, unlike QR1's 1-second SLA on the main path. |
+| 3 | Accuracy | Still needs QR3's 90% floor. Since there's no latency pressure, nothing forces a cheaper, less accurate model. |
 
 ## 2. Design / การออกแบบ
 
@@ -68,16 +68,34 @@ Your topology, the patterns you add, and a container-level diagram (C4 level 2).
 
 *topology ที่เลือก pattern ที่เพิ่ม และ diagram ระดับ container (C4 level 2) เขียนด้วย Mermaid*
 
+Topology: **T4 Asynchronous/batch**, fed by a local buffer on the kiosk (a bit of T2, model-as-a-library thinking, applied to durable storage instead of the model itself) so the tablet can keep accepting reviews while offline.
+
+Patterns added:
+- **Fallback** (Task 1): if the nightly batch job can't reach the large model, affected reviews stay `pending` and retry on the next run, instead of blocking or dropping them.
+- **Cache** (Task 3): common short reviews ("Delicious!", "Too salty") are served from cache during the batch run, cutting large-model calls without touching accuracy.
+- No cascade: since there's no 1-second SLA to protect, the batch job can afford to send every non-cached review straight to the large model and get the full 93.5% accuracy, instead of trading accuracy for speed.
+
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
-    Person(customer, "Customer", "Writes restaurant reviews")
-    System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+    title Canteen kiosk: container diagram
+    Person(customer, "Student", "Writes a review on the kiosk tablet, possibly offline")
+    Person(owner, "Restaurant owner", "Views end-of-day labeled reviews")
+    System_Boundary(kiosk, "Canteen kiosk") {
+        Container(kioskApp, "Kiosk app", "Tablet")
+        ContainerDb(localQueue, "Local review queue", "SQLite on tablet", "Durable storage until sync succeeds")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+    System_Boundary(campuseats, "CampusEats") {
+        Container(gateway, "API gateway", "Python, FastAPI, :8000", "Single entry point for synced reviews")
+        Container(review, "Review service", "Python, FastAPI, :8001", "Stores reviews; nightly batch job scores pending ones")
+        Container(inference, "Inference service", "Python, FastAPI, scikit-learn, :8002", "Large model plus prediction cache")
+    }
+    Rel(customer, kioskApp, "Writes review", "Local UI")
+    Rel(kioskApp, localQueue, "Buffers while offline", "Local write")
+    Rel(localQueue, gateway, "Syncs once Wi-Fi returns", "HTTP/JSON")
+    Rel(gateway, review, "Forwards review", "HTTP/JSON")
+    Rel(review, inference, "Batch POST /predict (nightly)", "REST")
+    Rel(owner, gateway, "Views labeled reviews", "HTTP/JSON")
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="2")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +106,9 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+| t1-after | Fallback keeps every review (0 errors, 17 pending instead of lost) when the large model can't answer in time. The kiosk design reuses this same safety net for the nightly batch run. |
+| t0-large | Scoring everything with the large model alone reaches 93.5% accuracy, same floor as QR3. Affordable here because there's no latency SLA forcing a cascade threshold trade-off like CampusEats' real-time path needs. |
+| t3-cache | Caching answers 35% of requests from cache and cuts large-model calls to 38%, lowering the nightly batch's compute cost for free, with no accuracy loss (93.0% accuracy, same ballpark as large-only). |
 
 ## 4. ADR
 
@@ -97,20 +116,17 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+
+**Title:** Batch-score canteen kiosk reviews with local buffering, cache, and fallback
 
 **Status:** Proposed
 
-**Context:**
+**Context:** Canteen Wi-Fi drops several times a day for minutes at a time, but the kiosk must never lose a review, and owners only need labels by the end of the day, not in real time.
 
-**Decision:**
+**Decision:** Buffer reviews locally on the tablet while offline and sync them once connectivity returns. Score synced reviews with a nightly batch job (T4) that checks the cache first, then calls the large model directly for everything else, and falls back to `pending` for retry on the next run if the large model is briefly unavailable.
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: no review is ever lost regardless of connectivity; accuracy stays at the large model's full 93.5% since there's no SLA forcing a cascade trade-off; caching cuts about a third of large-model calls for free.
+- Negative: owners never see same-day feedback, since everything waits for the next batch window; the kiosk app needs its own local storage and sync logic; a multi-day outage could push a batch past the end-of-day deadline.
 
-**Alternatives considered:** at least one topology you rejected, and why.
-
-*อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
-
->
+**Alternatives considered:** T1 (today's baseline, model as a service called synchronously per review). Rejected because it requires the tablet to be online for every single review, which breaks the core offline requirement outright.
